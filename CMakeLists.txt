@@ -26,13 +26,15 @@ find_package(sensor_msgs REQUIRED)
 find_package(geometry_msgs REQUIRED)
 
 add_executable(position_to_accel_ppid_node src/position_to_accel_ppid_node.cpp)
+add_executable(DOB_Controller src/DOB_Controller.cpp)
 ament_target_dependencies(position_to_accel_ppid_node rclcpp px4_msgs geometry_msgs)
+ament_target_dependencies(DOB_Controller rclcpp px4_msgs geometry_msgs)
 
 target_include_directories(position_to_accel_ppid_node PUBLIC
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
   $<INSTALL_INTERFACE:include>)
 
-install(TARGETS position_to_accel_ppid_node
+install(TARGETS position_to_accel_ppid_node DOB_Controller
   DESTINATION lib/${PROJECT_NAME})
 
 if(BUILD_TESTING)

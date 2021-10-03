@@ -12,9 +12,9 @@
 using namespace std::chrono;
 using namespace std::chrono_literals;
 
-class PPID : public rclcpp::Node {
+class DOBController : public rclcpp::Node {
 public:
-	PPID() : Node("garrard_position_to_acceleration") {
+	DOBController() : Node("garrard_DOB_Controller") {
 
 		acceleration_setpoint_publisher_ =
 			this->create_publisher<px4_msgs::msg::TrajectorySetpoint>("garrard_accelerationsetpoint_pubsub", 1);
@@ -68,15 +68,16 @@ private:
 	rclcpp::Publisher<px4_msgs::msg::TrajectorySetpoint>::SharedPtr acceleration_setpoint_publisher_;
 	// rclcpp::Publisher<px4_msgs::msg::VehicleLocalPositionSetpoint>::SharedPtr acceleration_setpoint_publisher_;
 	
-    px4_msgs::msg::VehicleLocalPosition vehicle_pose_history[3];
-	px4_msgs::msg::VehicleLocalPosition filtered_vehicle_pose_history[3];	// After filtering velocity
+    px4_msgs::msg::VehicleLocalPosition vehicle_pose_history[4];
+	px4_msgs::msg::VehicleLocalPosition filtered_vehicle_pose_history[4];	// After filtering velocity
 	px4_msgs::msg::TrajectorySetpoint sp_current;
+	px4_msgs::msg::VehicleLocalPosition vehicle_local_pose_{};
 
 	std::atomic<int64_t> fcu_timestamp;
 
 	// Gains for P-PID
 	float kpp_xy = 0.95, kpv_xy = 1.8, kiv_xy = 0.4, kdv_xy = 0.2;	// xy position and velocity PID gains
-	float kpp_z = 1, kpv_z = 5, kiv_z = 2, kdv_z = 0;	// z position and velocity PID gains
+	float kpp_z = 1, kpv_z = 5, kiv_z = 0, kdv_z = 0;	// z position and velocity PID gains
 
 	// Max velocities and acceleration
 	float max_vxy = 12;	// max horizontal velocity in m/s			Default: 12
@@ -93,18 +94,26 @@ private:
 	float accumulator_y = 0;
 	float accumulator_z = 0;
 
-	px4_msgs::msg::VehicleLocalPosition vehicle_local_pose_{};
+	// DOB
+	float d_hat[3] = {};
+	float u[3] = {};
+	float omega_0 = 10;
+	float zeta = 1;
+	int iter_dob = 0;
+	//T is the same as dt
 
     void update_controller() 
 	{
 		RCLCPP_INFO(get_logger(), "Updating controller");
 
         // Have the last three pose information available for later use
+		// vehicle_pose_history[3] = vehicle_pose_history[2];
         vehicle_pose_history[2] = vehicle_pose_history[1];
         vehicle_pose_history[1] = vehicle_pose_history[0];
         vehicle_pose_history[0] = vehicle_local_pose_;
 
 		// Have the last three pose information with filtered velocity for later use
+		// filtered_vehicle_pose_history[3] = filtered_vehicle_pose_history[2];
 		filtered_vehicle_pose_history[2] = filtered_vehicle_pose_history[1];
         filtered_vehicle_pose_history[1] = filtered_vehicle_pose_history[0];
         filtered_vehicle_pose_history[0] = vehicle_local_pose_;
@@ -113,6 +122,7 @@ private:
 		float dt = vehicle_pose_history[0].timestamp_sample - vehicle_pose_history[1].timestamp_sample;
 		dt /= 1000000;
 		dt = bound(dt, min_dt, max_dt);
+		// RCLCPP_WARN(get_logger(),"dt:%2.4f",dt);
 
 		//=====Calculate Position Errors======================
 
@@ -260,6 +270,54 @@ private:
 		// 	scaled_z_thrust /= abs(scaled_z_thrust);
 		// }
 
+
+		//======Disturbance Observer===========
+
+		// u[3] = u[2];
+		u[2] = u[1]; 
+		u[1] = u[0]; 
+		// u[0] = sp_az;
+		// d_hat[3] = d_hat[2]; 
+		d_hat[2] = d_hat[1];
+		d_hat[1] = d_hat[0];
+		float z[] = {vehicle_pose_history[0].z, vehicle_pose_history[1].z, vehicle_pose_history[2].z};
+		float T = dt;
+
+		if (iter_dob++ > 1000) {
+			RCLCPP_WARN_ONCE(get_logger(), "STARTING DOB");
+
+			// d_hat[1] = 	(1.0/4.0+4.0*T*zeta*omega_0+T*T*omega_0*omega_0)
+			// 			*(4.0*omega_0*z[1]-8*omega_0*omega_0*z[2]+4*omega_0*omega_0*z[3]
+			// 			-T*T*omega_0*omega_0*u[1]-2*T*T*omega_0*omega_0*u[2]-T*T*omega_0*omega_0*u[3]
+			// 			-(-8+2*T*T*omega_0*omega_0)*d_hat[2]-(4-4*T*zeta*omega_0+T*T*omega_0*omega_0)*d_hat[3]);
+
+			// d_hat[0] = 	(1.0/(4.0+4.0*T*zeta*omega_0+T*T*omega_0*omega_0))
+			// 			*(4.0*omega_0*z[0]-8*omega_0*omega_0*z[1]+4*omega_0*omega_0*z[2]
+			// 			-T*T*omega_0*omega_0*u[0]-2*T*T*omega_0*omega_0*u[1]-T*T*omega_0*omega_0*u[2]
+			// 			-(-8+2*T*T*omega_0*omega_0)*d_hat[1]-(4-4*T*zeta*omega_0+T*T*omega_0*omega_0)*d_hat[2]);
+
+			float den = 1.0/(4.0+4.0*T*zeta*omega_0+T*T*omega_0*omega_0);
+			float z_calc = 4.0*omega_0*omega_0*z[0]-8*omega_0*omega_0*z[1]+4*omega_0*omega_0*z[2];
+			float u_calc = -T*T*omega_0*omega_0*u[0]-2*T*T*omega_0*omega_0*u[1]-T*T*omega_0*omega_0*u[2];
+			float d_hat_calc = -(-8+2*T*T*omega_0*omega_0)*d_hat[1]-(4-4*T*zeta*omega_0+T*T*omega_0*omega_0)*d_hat[2];
+			
+			d_hat[0] = den * (z_calc+u_calc+d_hat_calc);
+
+			RCLCPP_WARN(get_logger(), "\nden=\t%2.4f\nz_calc=\t%2.4f\nu_calc=\t%2.4f\nd_hat_calc=\t%2.4f",
+						den, z_calc, u_calc, d_hat_calc);
+
+			sp_az -= d_hat[0];
+		}
+
+
+		RCLCPP_WARN(get_logger(), "\niter_dob=%d\tT=%2.4f\tomega_0=%2.4f\tzeta=%2.4f\tsp_az=%2.4f\nd[0]=%2.4f\td[1]=%2.4f\td[2]=%2.4f\nu[0]=%2.4f\tu[1]=%2.4f\tu[2]=%2.4f\nz[0]=%2.4f\tz[1]=%2.4f\tz[2]=%2.4f", 
+						iter_dob, T, omega_0, zeta, sp_az,
+						d_hat[0],d_hat[1],d_hat[2],
+						u[0],u[1],u[2],
+						z[0],z[1],z[2]);
+
+		u[0] = sp_az;
+
 		//======Set offboard control==============
 		px4_msgs::msg::OffboardControlMode offboard_msg{};
 		offboard_msg.timestamp = fcu_timestamp;
@@ -277,37 +335,19 @@ private:
 		sp.x = NAN;
 		sp.y = NAN;
 		sp.z = NAN;
-		// sp.x = 0;
-		// sp.y = 0;
-		// sp.z = -2;
 		sp.yaw = 0;
-		// sp.yawspeed = 0;
 		sp.vx = NAN;
 		sp.vy = NAN;
 		sp.vz = NAN;
-		// sp.acceleration = {NAN, NAN, NAN};
-		// sp.acceleration[0] = scaled_x_thrust;
-		// sp.acceleration[1] = scaled_y_thrust;
-		// sp.acceleration[2] = scaled_z_thrust;
 		sp.acceleration[0] = sp_ax;
 		sp.acceleration[1] = sp_ay;
 		sp.acceleration[2] = sp_az;
-		// sp.acceleration[0] = 0;
-		// sp.acceleration[1] = 0;
-		// sp.acceleration[2] = -1;
-		// sp.jerk[0] = 0;
-		// sp.jerk[1] = 0;
-		// sp.jerk[2] = 0;
-		// sp.thrust = {NAN, NAN, NAN};
-		// sp.thrust[0] = scaled_x_thrust;
-		// sp.thrust[1] = scaled_y_thrust;
-		// sp.thrust[2] = scaled_z_thrust;
 		RCLCPP_INFO(get_logger(),
 					"Setpoint acc info:\tsp.acc.x:\t%4.8f\tsp.acc.y:\t%4.8f\tsp.acc.z:\t%4.8f",
 					sp.acceleration[0], sp.acceleration[1], sp.acceleration[2]);
 		RCLCPP_INFO(get_logger(),
 					"Setpoint thrust info:\tsp.thrust.x:\t%4.8f\tsp.thrust.y:\t%4.8f\tsp.thrust.z:\t%4.8f",
-					sp.thrust[0], sp.thrust[1], sp.thrust[2]);
+					sp.thrust[0], sp.thrust[1], sp.thrust[2]);		
 		acceleration_setpoint_publisher_->publish(sp);
 		RCLCPP_INFO(get_logger(), "Publishing setpoint");
     }
@@ -368,17 +408,17 @@ private:
 		else isInBound = 0;
 
 		RCLCPP_INFO(get_logger(), 
-					"\tval:\t%4.8f\tmin_val:\t%4.8f\tmax_val:\t%4.8f\tisInBound:\t%d", 
+					"val:\t%4.8f\tmin_val:\t%4.8f\tmax_val:\t%4.8f\tisInBound:\t%d", 
 					val, min_val, max_val, isInBound);
 		return isInBound;
 	}
 };
 
 int main(int argc, char* argv[]) {
-	std::cout << "Starting garrard_position_to_acceleration node..." << std::endl;
+	std::cout << "Starting garrard_DOB_Controller node..." << std::endl;
 	setvbuf(stdout, NULL, _IONBF, BUFSIZ);
 	rclcpp::init(argc, argv);
-	rclcpp::spin(std::make_shared<PPID>());
+	rclcpp::spin(std::make_shared<DOBController>());
 
 	rclcpp::shutdown();
 	return 0;
